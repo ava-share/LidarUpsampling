@@ -1,0 +1,154 @@
+#!/usr/bin/env python
+'''
+Author: Jonas Lossner
+Description: Playing around with interpolation methods to synthetically enhance pointcloud density
+'''
+import rospy
+from sensor_msgs.msg import PointCloud2, PointField
+import sensor_msgs.point_cloud2 as pc2
+import numpy as np
+import std_msgs.msg
+import ros_numpy
+from scipy.spatial import Delaunay
+from sklearn.neighbors import KernelDensity
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import NearestNeighbors
+from scipy.interpolate import griddata
+
+#crop pointcloud to reduce load
+lim_x=[3, 80]
+lim_y=[-15,15]
+lim_z=[-10,5]
+
+fields = [pc2.PointField(name='x', offset=0, datatype=pc2.PointField.FLOAT32, count=1),pc2.PointField(name='y', offset=4,datatype=pc2.PointField.FLOAT32, count=1),pc2.PointField(name='z', offset=8,datatype=pc2.PointField.FLOAT32, count=1),pc2.PointField(name='intensity', offset=12,datatype=pc2.PointField.FLOAT32, count=1)]
+
+header = std_msgs.msg.Header()
+header.frame_id = 'lidar_tc'
+
+def create_cloud(line_3d):
+    header.stamp = rospy.Time.now()
+    lane_pointcloud = PointCloud2()
+   
+    lane_pointcloud = pc2.create_cloud(header, fields, line_3d)
+    return lane_pointcloud
+
+def crop_pointcloud(pointcloud):
+    mask = np.where((pointcloud[:, 0] >= lim_x[0]) & (pointcloud[:, 0] <= lim_x[1]) & (pointcloud[:, 1] >=lim_y[0]) & (pointcloud[:, 1] <= lim_y[1]) & (pointcloud[:, 2] >= lim_z[0]) & (pointcloud[:, 2] <= lim_z[1]))
+    pointcloud = pointcloud[mask]
+    return pointcloud
+
+def gaussian_mixture_models_upsampling(points, intensity_values, n_components=10000):
+    gmm = GaussianMixture(n_components=n_components)
+    gmm.fit(points)
+
+    upsampled_points = gmm.sample(n_samples=n_components)[0]
+    intensity = np.ones(n_components)  # Placeholder intensity values (all set to 1)
+
+    upsampled_points = np.column_stack((upsampled_points, intensity))
+    return upsampled_points
+
+def surface_reconstruction_upsampling(points, intensity_values, resolution=0.2):
+    # Define the bounding box dimensions based on the range of the point cloud
+    min_x, min_y, min_z = np.min(points, axis=0)
+    max_x, max_y, max_z = np.max(points, axis=0)
+
+    # Create a grid of points within the bounding box
+    x_grid = np.arange(min_x, max_x, resolution)
+    y_grid = np.arange(min_y, max_y, resolution)
+    x_mesh, y_mesh = np.meshgrid(x_grid, y_grid)
+    z_mesh = griddata(points[:, :2], points[:, 2], (x_mesh, y_mesh), method='linear')
+
+    # Flatten the grid into a set of upsampled points
+    upsampled_points = np.column_stack((x_mesh.flatten(), y_mesh.flatten(), z_mesh.flatten()))
+
+    # Interpolate intensity values for the upsampled points
+    nbrs = NearestNeighbors(n_neighbors=1).fit(points[:, :2])
+    _, indices = nbrs.kneighbors(upsampled_points[:, :2])
+    interpolated_intensity = intensity_values[indices.ravel()]
+
+    upsampled_points = np.column_stack((upsampled_points, interpolated_intensity))
+    return upsampled_points
+
+def kernel_density_estimation_upsampling(points, intensity_values, bandwidth=0.1, num_samples=10000):
+    kde = KernelDensity(bandwidth=bandwidth)
+    kde.fit(points)
+
+    samples = kde.sample(num_samples)
+    intensity = np.ones(num_samples)  # Placeholder intensity values (all set to 1)
+
+    upsampled_points = np.column_stack((samples, intensity))
+    return upsampled_points
+
+def moving_least_squares_upsampling(points, intensity_values, radius=100, degree=1):
+    nbrs = NearestNeighbors(n_neighbors=radius, algorithm='kd_tree').fit(points)
+    _, indices = nbrs.kneighbors(points)
+
+    upsampled_points = []
+    for i, neighbors in enumerate(indices):
+        X = points[neighbors]
+        y = intensity_values[neighbors]
+
+        # Apply Moving Least Squares
+        poly = PolynomialFeatures(degree=degree)
+        X_poly = poly.fit_transform(X)
+        model = LinearRegression()
+        model.fit(X_poly, y.reshape(-1, 1))
+        interpolated_intensity = model.predict(poly.transform(points[i].reshape(1, -1)))[0, 0]
+
+        upsampled_points.append(np.hstack((points[i], interpolated_intensity)))
+
+    upsampled_points = np.array(upsampled_points)
+    return upsampled_points
+
+def delaunay_upsampling(points):
+    tri = Delaunay(points)
+    interpolated_points = np.mean(points[tri.simplices], axis=1)
+    interpolated_intensity = np.ones(interpolated_points.shape[0])      # Placeholder intensity values (all set to 1)
+
+    interpolated_point_cloud = np.column_stack((interpolated_points, interpolated_intensity))
+    return interpolated_point_cloud
+
+def interpolate_lidar(msg):
+
+    print("Calculating Upsampling")
+
+    pc = ros_numpy.numpify(msg)
+
+    input_points=np.zeros((pc.shape[0],4))
+    input_points[:,0]=pc['x']
+    input_points[:,1]=pc['y']
+    input_points[:,2]=pc['z']
+    input_points[:,3]=pc['intensity']
+    input_points = crop_pointcloud(input_points)
+   
+    points = np.column_stack((input_points[:,0], input_points[:,1], input_points[:,2]))
+    #interpolated_point_cloud = delaunay_upsampling(points)
+    #interpolated_point_cloud = moving_least_squares_upsampling(points,input_points[:,3])#idk this basically doesn't do anything
+    #interpolated_point_cloud = gaussian_mixture_models_upsampling(points,input_points[:,3]) 
+    #interpolated_point_cloud = kernel_density_estimation_upsampling(points,input_points[:,3]) #basically creates more points just right around the original points
+    interpolated_point_cloud = surface_reconstruction_upsampling(points,input_points[:,3])
+
+
+    interpolated_msg = PointCloud2()
+
+    # Convert the interpolated point cloud to ROS PointCloud2 format
+    interpolated_msg = create_cloud(interpolated_point_cloud)
+
+    # Publish the interpolated point cloud
+    pub.publish(interpolated_msg)
+
+if __name__ == '__main__':
+    # Initialize the ROS node
+    rospy.init_node('lidar_interpolation_node')
+
+    # Create a subscriber for the input point cloud
+    rospy.Subscriber('/lidar_tc/velodyne_points', PointCloud2, interpolate_lidar)
+
+    # Create a publisher for the interpolated point cloud
+    pub = rospy.Publisher('/interpolated_point_cloud_topic', PointCloud2, queue_size=1)
+
+    # Spin ROS
+    rospy.spin()
